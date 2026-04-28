@@ -9,7 +9,6 @@ A simple Node.js Express application demonstrating Docker containerization and n
 - ngrok
 
 ## Quick Start
-
 ### 1. Build the Docker Image
 
 ```bash
