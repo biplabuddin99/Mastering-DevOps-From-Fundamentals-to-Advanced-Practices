@@ -1,0 +1,45 @@
+# SSH Keys and Credentials
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+*.ppk
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Node modules (if you add Node.js later)
+node_modules/
+
+# Python (if you add Python scripts)
+__pycache__/
+*.py[cod]
+venv/
+env/
+
+# Backup files
+*.bak
+*.backup
