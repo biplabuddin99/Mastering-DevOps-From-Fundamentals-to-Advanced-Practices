@@ -3,7 +3,6 @@
 Automated AWS EC2 instance management using GitHub Actions workflows over SSH — no AWS CLI, no IAM user credentials, no bastion host required. All operations are driven by GitHub-hosted runners connecting directly to EC2 via a stored SSH key.  || Check On Push .. Main Branch
 
 ---
-
 ## Table of Contents
 
 1. [What is GitHub Actions?](#what-is-github-actions)
