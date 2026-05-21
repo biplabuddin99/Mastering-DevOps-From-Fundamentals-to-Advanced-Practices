@@ -1,0 +1,462 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      backend_only:
+        description: 'Deploy backend only'
+        required: false
+        type: boolean
+        default: false
+      frontend_only:
+        description: 'Deploy frontend only'
+        required: false
+        type: boolean
+        default: false
+      skip_health_check:
+        description: 'Skip health check'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  DEPLOY_PATH: /home/ubuntu/single-server-3tier-webapp
+  FRONTEND_DEPLOY_PATH: /var/www/bmi-health-tracker
+  DB_NAME: bmidb
+  DB_USER: bmi_user
+  NODE_VERSION: 'lts/*'
+
+jobs:
+  deploy:
+    #runs-on: ubuntu-latest
+    ##runs-on: [self-hosted, Linux, X64]
+    runs-on: self-hosted
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+        log-public-key: true
+
+    - name: Configure SSH to skip host key checking
+      run: |
+        mkdir -p ~/.ssh
+        cat >> ~/.ssh/config <<EOF
+        Host ${{ secrets.EC2_HOST }}
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
+        EOF
+        chmod 600 ~/.ssh/config
+
+    - name: Test SSH Connection
+      run: |
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'"
+
+    - name: Get Runner Public IP
+      run: |
+        echo "=========================================="
+        echo "Runner Public IP Information"
+        echo "=========================================="
+        RUNNER_IP=$(curl -s http://api.ipify.org/?format=text)
+        echo "Runner Public IP: $RUNNER_IP"
+        echo "runner_ip=$RUNNER_IP" >> $GITHUB_OUTPUT        
+
+    - name: Install Prerequisites (if needed)
+      run: |
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
+          set -e
+          
+          echo "=========================================="
+          echo "Installing/Verifying Prerequisites"
+          echo "=========================================="
+          
+          # Function to install NVM if not present
+          install_nvm() {
+            if [ ! -d "$HOME/.nvm" ]; then
+              echo "Installing NVM..."
+              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+              export NVM_DIR="$HOME/.nvm"
+              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+              echo "NVM installed"
+            else
+              echo "NVM already installed"
+            fi
+          }
+          
+          # Function to load NVM
+          load_nvm() {
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          }
+          
+          # Install NVM
+          install_nvm
+          
+          # Load NVM
+          load_nvm
+          
+          # Install Node.js if not present
+          if ! command -v node &> /dev/null; then
+            echo "Installing Node.js ${{ env.NODE_VERSION }}..."
+            nvm install ${{ env.NODE_VERSION }}
+            nvm use ${{ env.NODE_VERSION }}
+            nvm alias default ${{ env.NODE_VERSION }}
+            echo "Node.js $(node --version) installed"
+          else
+            echo "Node.js $(node --version) already installed"
+            nvm install ${{ env.NODE_VERSION }}
+            nvm use ${{ env.NODE_VERSION }}
+          fi
+          
+          # Install PM2 if not present
+          if ! command -v pm2 &> /dev/null; then
+            echo "Installing PM2..."
+            npm install -g pm2
+            echo "PM2 installed"
+          else
+            echo "PM2 $(pm2 --version) already installed"
+          fi
+          
+          # Install Nginx if not present
+          if ! command -v nginx &> /dev/null; then
+            echo "Installing Nginx..."
+            sudo apt update
+            sudo apt install -y nginx
+            sudo systemctl enable nginx
+            sudo systemctl start nginx
+            echo "Nginx installed and started"
+          else
+            echo "Nginx already installed"
+            sudo systemctl is-active nginx || sudo systemctl start nginx
+          fi
+          
+          # Verify installations
+          echo ""
+          echo "Installed versions:"
+          echo "  Node: $(node --version)"
+          echo "  npm: $(npm --version)"
+          echo "  PM2: $(pm2 --version)"
+          echo "  Nginx: $(nginx -v 2>&1 | cut -d/ -f2)"
+          echo ""
+        ENDSSH
+
+    - name: Check if deployment exists
+      id: check_deployment
+      run: |
+        DEPLOYMENT_EXISTS=$(ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "[ -d ${{ env.DEPLOY_PATH }} ] && echo 'true' || echo 'false'")
+        echo "exists=$DEPLOYMENT_EXISTS" >> $GITHUB_OUTPUT
+        echo "Deployment exists: $DEPLOYMENT_EXISTS"
+
+    - name: Setup Database
+      run: |
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
+          set -e
+          
+          echo "=========================================="
+          echo "Setting up PostgreSQL Database"
+          echo "=========================================="
+          
+          # Check if PostgreSQL is installed
+          if ! command -v psql &> /dev/null; then
+            echo "Installing PostgreSQL..."
+            sudo apt update
+            sudo apt install -y postgresql postgresql-contrib
+            sudo systemctl enable postgresql
+            sudo systemctl start postgresql
+            echo "PostgreSQL installed and started"
+          else
+            echo "PostgreSQL already installed"
+            sudo systemctl is-active postgresql || sudo systemctl start postgresql
+          fi
+          
+          # Wait for PostgreSQL to be ready
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if sudo -u postgres psql -c '\q' 2>/dev/null; then
+              echo "PostgreSQL is ready"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 1
+          done
+          
+          # Create database user if not exists
+          echo "Setting up database user..."
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_user WHERE usename = '${{ env.DB_USER }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE USER ${{ env.DB_USER }} WITH PASSWORD '${{ secrets.DB_PASSWORD }}';"
+          
+          # Create database if not exists
+          echo "Setting up database..."
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '${{ env.DB_NAME }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE DATABASE ${{ env.DB_NAME }} OWNER ${{ env.DB_USER }};"
+          
+          # Grant privileges
+          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${{ env.DB_NAME }} TO ${{ env.DB_USER }};"
+          
+          # Configure PostgreSQL for local connections
+          PG_VERSION=$(psql --version | awk '{print $3}' | cut -d. -f1)
+          PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+          
+          if ! sudo grep -q "host.*${{ env.DB_NAME }}.*${{ env.DB_USER }}" "$PG_HBA"; then
+            echo "Configuring PostgreSQL authentication..."
+            echo "host    ${{ env.DB_NAME }}    ${{ env.DB_USER }}    127.0.0.1/32    md5" | sudo tee -a "$PG_HBA" > /dev/null
+            sudo systemctl reload postgresql
+          fi
+          
+          echo "Database setup completed successfully"
+          echo ""
+        ENDSSH
+
+    - name: Create backup (if deployment exists)
+      if: steps.check_deployment.outputs.exists == 'true'
+      run: |
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+          mkdir -p ~/bmi_deployments_backup
+          if [ -d "${{ env.DEPLOY_PATH }}" ]; then
+            echo "Creating backup..."
+            cp -r ${{ env.DEPLOY_PATH }} ~/bmi_deployments_backup/backup_${TIMESTAMP}
+            echo "Backup created at ~/bmi_deployments_backup/backup_${TIMESTAMP}"
+          fi
+        EOF
+
+    - name: Deploy application
+      run: |
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
+          set -e
+          
+          # Load NVM
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          
+          # Use Node LTS
+          nvm use ${{ env.NODE_VERSION }}
+          
+          echo "=========================================="
+          echo "Deploying Application"
+          echo "=========================================="
+          echo "Node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo ""
+          
+          # Clone or pull repository
+          if [ ! -d "${{ env.DEPLOY_PATH }}" ]; then
+            echo "Fresh deployment - cloning repository..."
+            git clone https://github.com/${{ github.repository }}.git ${{ env.DEPLOY_PATH }}
+          else
+            echo "Updating existing deployment..."
+            cd ${{ env.DEPLOY_PATH }}
+            git fetch origin
+            git reset --hard origin/main
+          fi
+          
+          cd ${{ env.DEPLOY_PATH }}
+          
+          # Deploy backend
+          if [ "${{ github.event.inputs.frontend_only }}" != "true" ]; then
+            echo ""
+            echo "=========================================="
+            echo "Deploying Backend"
+            echo "=========================================="
+            cd backend
+            
+            # Install dependencies
+            echo "Installing backend dependencies..."
+            npm install
+            
+            # Setup environment variables
+            echo "Setting up environment variables..."
+            echo "DATABASE_URL=postgresql://${{ env.DB_USER }}:${{ secrets.DB_PASSWORD }}@localhost:5432/${{ env.DB_NAME }}" > .env
+            echo "NODE_ENV=production" >> .env
+            echo "PORT=3000" >> .env
+            
+            # Run migrations if they exist
+            if [ -d "migrations" ]; then
+              echo "Running database migrations..."
+              for migration in migrations/*.sql; do
+                if [ -f "$migration" ]; then
+                  echo "Running $(basename $migration)..."
+                  PGPASSWORD='${{ secrets.DB_PASSWORD }}' psql -h localhost -U ${{ env.DB_USER }} -d ${{ env.DB_NAME }} -f "$migration" || true
+                fi
+              done
+              echo "Migrations completed"
+            fi
+            
+            # Check if server.js exists in src/ directory
+            if [ -f "src/server.js" ]; then
+              SERVER_FILE="src/server.js"
+            elif [ -f "server.js" ]; then
+              SERVER_FILE="server.js"
+            else
+              echo "Error: server.js not found in backend/ or backend/src/"
+              exit 1
+            fi
+            
+            echo "Using server file: $SERVER_FILE"
+            
+            # Restart backend with PM2
+            if pm2 describe bmi-backend > /dev/null 2>&1; then
+              echo "Restarting existing PM2 process..."
+              pm2 restart bmi-backend --update-env
+            else
+              echo "Starting new PM2 process..."
+              pm2 start $SERVER_FILE --name bmi-backend
+              pm2 save
+            fi
+            
+            echo "Backend deployed successfully"
+            cd ..
+          fi
+          
+          # Deploy frontend
+          if [ "${{ github.event.inputs.backend_only }}" != "true" ]; then
+            echo ""
+            echo "=========================================="
+            echo "Deploying Frontend"
+            echo "=========================================="
+            cd frontend
+            
+            # Install dependencies
+            echo "Installing frontend dependencies..."
+            npm install
+            
+            # Build frontend
+            echo "Building frontend..."
+            npm run build
+            
+            # Check if Nginx is installed
+            if ! command -v nginx &> /dev/null; then
+              echo "Warning: Nginx not found. Skipping frontend deployment."
+              echo "Please install Nginx manually or re-run the prerequisite installation."
+              cd ..
+              exit 0
+            fi
+            
+            # Deploy to Nginx
+            echo "Deploying to Nginx..."
+            sudo mkdir -p ${{ env.FRONTEND_DEPLOY_PATH }}
+            sudo cp -r dist/* ${{ env.FRONTEND_DEPLOY_PATH }}/
+            sudo chown -R www-data:www-data ${{ env.FRONTEND_DEPLOY_PATH }}
+            
+            # Configure Nginx
+            echo "Creating Nginx configuration..."
+            printf '%s\n' \
+              'server {' \
+              '    listen 80;' \
+              '    server_name _;' \
+              '' \
+              '    root /var/www/bmi-health-tracker;' \
+              '    index index.html;' \
+              '' \
+              '    location / {' \
+              '        try_files $uri $uri/ /index.html;' \
+              '    }' \
+              '' \
+              '    location /api/ {' \
+              '        proxy_pass http://127.0.0.1:3000/api/;' \
+              '        proxy_http_version 1.1;' \
+              '        proxy_set_header Upgrade $http_upgrade;' \
+              '        proxy_set_header Connection '"'"'upgrade'"'"';' \
+              '        proxy_set_header Host $host;' \
+              '        proxy_cache_bypass $http_upgrade;' \
+              '        proxy_set_header X-Real-IP $remote_addr;' \
+              '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
+              '    }' \
+              '}' | sudo tee /etc/nginx/sites-available/bmi-health-tracker > /dev/null
+            
+            sudo ln -sf /etc/nginx/sites-available/bmi-health-tracker /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
+            
+            # Test Nginx config
+            sudo nginx -t
+            
+            # Reload Nginx
+            sudo systemctl reload nginx
+            
+            echo "Frontend deployed successfully"
+            cd ..
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "Deployment Completed Successfully"
+          echo "=========================================="
+          echo ""
+        ENDSSH
+
+    - name: Health Check
+      if: github.event.inputs.skip_health_check != 'true'
+      run: |
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
+          # Load NVM
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          
+          echo "=========================================="
+          echo "Running Health Checks"
+          echo "=========================================="
+          
+          # Wait for services to start
+          echo "Waiting for services to stabilize..."
+          sleep 5
+          
+          # Check backend health
+          echo ""
+          echo "Testing backend health..."
+          HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health || echo "000")
+          
+          if [ "$HEALTH_CHECK" = "200" ]; then
+            echo "Backend health check passed (HTTP $HEALTH_CHECK)"
+          else
+            echo "Backend health check failed (HTTP $HEALTH_CHECK)"
+            echo "Backend logs:"
+            pm2 logs bmi-backend --lines 20 --nostream
+            exit 1
+          fi
+          
+          # Check PM2 status
+          echo ""
+          echo "PM2 Status:"
+          pm2 status
+          
+          # Check Nginx if installed
+          if command -v nginx &> /dev/null; then
+            echo ""
+            echo "Nginx Status:"
+            sudo systemctl status nginx --no-pager -l
+          fi
+          
+          echo ""
+          echo "All health checks passed"
+          echo ""
+        ENDSSH
+
+    - name: Deployment Summary
+      if: always()
+      run: |
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Repository** | ${{ github.repository }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Deployed to** | ${{ secrets.EC2_HOST }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Quick Links" >> $GITHUB_STEP_SUMMARY
+        echo "- **Application**: http://${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Health Check**: http://${{ secrets.EC2_HOST }}:3000/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Endpoint**: http://${{ secrets.EC2_HOST }}/api/measurements" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "**Deployment completed successfully**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "**Deployment failed. Check logs for details.**" >> $GITHUB_STEP_SUMMARY
+        fi
