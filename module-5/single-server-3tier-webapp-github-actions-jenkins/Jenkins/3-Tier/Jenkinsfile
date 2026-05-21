@@ -1,0 +1,761 @@
+// Jenkinsfile for BMI Health Tracker Three-Tier Application Deployment
+// This pipeline deploys the application to AWS EC2 Ubuntu server
+// Supports fresh deployment and updates to existing deployments
+
+pipeline {
+    agent any
+    
+    parameters {
+        string(
+            name: 'TARGET_EC2_IP',
+            defaultValue: '',
+            description: 'Public IP address of target EC2 server (e.g., 54.123.45.67)'
+        )
+        password(
+            name: 'DB_PASSWORD',
+            defaultValue: '',
+            description: 'PostgreSQL password for bmi_user (will be stored in .env file)'
+        )
+        booleanParam(
+            name: 'DEPLOY_BACKEND_ONLY',
+            defaultValue: false,
+            description: 'Deploy only backend (skip frontend deployment)'
+        )
+        booleanParam(
+            name: 'DEPLOY_FRONTEND_ONLY',
+            defaultValue: false,
+            description: 'Deploy only frontend (skip backend deployment)'
+        )
+        booleanParam(
+            name: 'SKIP_HEALTH_CHECK',
+            defaultValue: false,
+            description: 'Skip health checks after deployment (use with caution!)'
+        )
+        booleanParam(
+            name: 'SKIP_BACKUP',
+            defaultValue: false,
+            description: 'Skip creating backup before deployment (not recommended)'
+        )
+        choice(
+            name: 'LOG_LEVEL',
+            choices: ['info', 'debug', 'verbose'],
+            description: 'Logging verbosity level'
+        )
+    }
+    
+    environment {
+        // Git repository - using SCM checkout (repository this Jenkinsfile is in)
+        // No need to hardcode REPO_URL when using 'checkout scm'
+        BRANCH = env.BRANCH_NAME ?: 'main'
+        
+        // EC2 connection details
+        EC2_USER = 'ubuntu'
+        EC2_SSH_KEY_ID = 'ec2-ssh-key'  // Jenkins Credentials Manager: SSH Username with private key
+        
+        // Application deployment paths
+        DEPLOY_PATH = '/home/ubuntu/single-server-3tier-webapp'
+        BACKUP_PATH = '/home/ubuntu/bmi_deployments_backup'
+        
+        // Application configuration
+        APP_NAME = 'bmi-health-tracker'
+        PM2_PROCESS_NAME = 'bmi-backend'
+        NGINX_SITE_PATH = '/var/www/bmi-health-tracker'
+        
+        // Database configuration
+        DB_NAME = 'bmidb'
+        DB_USER = 'bmi_user'
+        DB_HOST = 'localhost'
+        DB_PORT = '5432'
+        
+        // Backend configuration
+        BACKEND_PORT = '3000'
+        NODE_ENV = 'production'
+        
+        // Health check configuration
+        HEALTH_CHECK_RETRIES = '5'
+        HEALTH_CHECK_DELAY = '10'
+        
+        // Build metadata
+        BUILD_TIMESTAMP = sh(script: 'date +%Y%m%d_%H%M%S', returnStdout: true).trim()
+        BACKUP_DIR = "backup_${BUILD_TIMESTAMP}"
+    }
+    
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo '======================================'
+                    echo '🔍 VALIDATING PARAMETERS'
+                    echo '======================================'
+                    
+                    // Validate TARGET_EC2_IP
+                    if (!params.TARGET_EC2_IP?.trim()) {
+                        error "❌ TARGET_EC2_IP parameter is required!"
+                    }
+                    
+                    // Validate IP format
+                    def ipPattern = /^(\d{1,3}\.){3}\d{1,3}$/
+                    if (!(params.TARGET_EC2_IP =~ ipPattern)) {
+                        error "❌ TARGET_EC2_IP must be a valid IPv4 address (e.g., 54.123.45.67)"
+                    }
+                    
+                    // Validate DB_PASSWORD (only for fresh deployment)
+                    if (!params.DB_PASSWORD?.trim()) {
+                        echo "⚠️  WARNING: DB_PASSWORD not provided. Will use existing .env or fail if fresh deployment."
+                    }
+                    
+                    // Validate conflicting parameters
+                    if (params.DEPLOY_BACKEND_ONLY && params.DEPLOY_FRONTEND_ONLY) {
+                        error "❌ Cannot set both DEPLOY_BACKEND_ONLY and DEPLOY_FRONTEND_ONLY!"
+                    }
+                    
+                    echo "✅ Parameter validation passed"
+                    echo "Target EC2: ${params.TARGET_EC2_IP}"
+                    echo "Deploy Backend: ${!params.DEPLOY_FRONTEND_ONLY}"
+                    echo "Deploy Frontend: ${!params.DEPLOY_BACKEND_ONLY}"
+                    echo "Skip Health Check: ${params.SKIP_HEALTH_CHECK}"
+                    echo "Skip Backup: ${params.SKIP_BACKUP}"
+                }
+            }
+        }
+        
+        stage('Checkout Code') {
+            steps {
+                script {
+                    echo '======================================'
+                    echo '📥 CHECKING OUT CODE FROM GIT'
+                    echo '======================================'
+                    echo "Branch: ${BRANCH}"
+                    
+                    // Using 'checkout scm' automatically uses the repository this Jenkinsfile is in
+                    // This works with the Git repository configuration in Jenkins job
+                    checkout scm
+                    
+                    // Display repository information
+                    sh '''
+                        echo "✅ Code checked out successfully"
+                        echo "Current directory: $(pwd)"
+                        echo "Git commit: $(git rev-parse --short HEAD)"
+                        echo "Git message: $(git log -1 --pretty=%B)"
+                        echo "Files in workspace:"
+                        ls -lh
+                    '''
+                }
+            }
+        }
+        
+        stage('Check Prerequisites') {
+            steps {
+                script {
+                    echo '======================================'
+                    echo '🔧 CHECKING PREREQUISITES ON TARGET EC2'
+                    echo '======================================'
+                    
+                    // Using Jenkins Credentials Manager for SSH authentication
+                    // Credential ID: 'ec2-ssh-key' (SSH Username with private key)
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        // Check if prerequisites are already installed
+                        def checkResult = sh(
+                            script: """
+                                ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                    # Check Node.js
+                                    if command -v node &> /dev/null; then
+                                        echo "Node.js: INSTALLED (Version: \$(node -v))"
+                                        NODE_INSTALLED=true
+                                    else
+                                        echo "Node.js: NOT INSTALLED"
+                                        NODE_INSTALLED=false
+                                    fi
+                                    
+                                    # Check PostgreSQL
+                                    if command -v psql &> /dev/null; then
+                                        echo "PostgreSQL: INSTALLED (Version: \$(psql --version | cut -d\" \" -f3))"
+                                        PG_INSTALLED=true
+                                    else
+                                        echo "PostgreSQL: NOT INSTALLED"
+                                        PG_INSTALLED=false
+                                    fi
+                                    
+                                    # Check Nginx
+                                    if command -v nginx &> /dev/null; then
+                                        echo "Nginx: INSTALLED (Version: \$(nginx -v 2>&1 | cut -d\"/\" -f2))"
+                                        NGINX_INSTALLED=true
+                                    else
+                                        echo "Nginx: NOT INSTALLED"
+                                        NGINX_INSTALLED=false
+                                    fi
+                                    
+                                    # Check PM2
+                                    if command -v pm2 &> /dev/null; then
+                                        echo "PM2: INSTALLED (Version: \$(pm2 -v))"
+                                        PM2_INSTALLED=true
+                                    else
+                                        echo "PM2: NOT INSTALLED"
+                                        PM2_INSTALLED=false
+                                    fi
+                                    
+                                    # Check if deployment directory exists
+                                    if [ -d "${DEPLOY_PATH}" ]; then
+                                        echo "Deployment directory: EXISTS (Update deployment)"
+                                        echo "DEPLOYMENT_TYPE=update"
+                                    else
+                                        echo "Deployment directory: NOT FOUND (Fresh deployment)"
+                                        echo "DEPLOYMENT_TYPE=fresh"
+                                    fi
+                                '
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo checkResult
+                        
+                        // Store deployment type for later stages
+                        env.DEPLOYMENT_TYPE = checkResult.contains('DEPLOYMENT_TYPE=update') ? 'update' : 'fresh'
+                        echo "\n✅ Prerequisites check completed"
+                        echo "Deployment Type: ${env.DEPLOYMENT_TYPE}"
+                    }
+                }
+            }
+        }
+        
+        stage('Install Prerequisites') {
+            when {
+                expression { env.DEPLOYMENT_TYPE == 'fresh' }
+            }
+            steps {
+                script {
+                    echo '======================================'
+                    echo '📦 INSTALLING PREREQUISITES (FRESH DEPLOYMENT)'
+                    echo '======================================'
+                    
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                set -e  # Exit on any error
+                                
+                                echo "Updating system packages..."
+                                sudo apt-get update -qq
+                                
+                                # Install Node.js via NVM
+                                if ! command -v node &> /dev/null; then
+                                    echo "Installing NVM and Node.js LTS..."
+                                    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+                                    export NVM_DIR="\$HOME/.nvm"
+                                    [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+                                    nvm install --lts
+                                    nvm use --lts
+                                    echo "✅ Node.js \$(node -v) installed"
+                                else
+                                    echo "✅ Node.js already installed"
+                                fi
+                                
+                                # Install PostgreSQL
+                                if ! command -v psql &> /dev/null; then
+                                    echo "Installing PostgreSQL..."
+                                    sudo apt-get install -y postgresql postgresql-contrib
+                                    sudo systemctl start postgresql
+                                    sudo systemctl enable postgresql
+                                    echo "✅ PostgreSQL installed and started"
+                                else
+                                    echo "✅ PostgreSQL already installed"
+                                fi
+                                
+                                # Install Nginx
+                                if ! command -v nginx &> /dev/null; then
+                                    echo "Installing Nginx..."
+                                    sudo apt-get install -y nginx
+                                    sudo systemctl start nginx
+                                    sudo systemctl enable nginx
+                                    echo "✅ Nginx installed and started"
+                                else
+                                    echo "✅ Nginx already installed"
+                                fi
+                                
+                                # Install PM2 globally
+                                export NVM_DIR="\$HOME/.nvm"
+                                [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+                                if ! command -v pm2 &> /dev/null; then
+                                    echo "Installing PM2..."
+                                    npm install -g pm2
+                                    pm2 startup systemd -u ${EC2_USER} --hp /home/${EC2_USER}
+                                    echo "✅ PM2 installed"
+                                else
+                                    echo "✅ PM2 already installed"
+                                fi
+                                
+                                echo "\n✅ All prerequisites installed successfully!"
+                            '
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Setup Database') {
+            when {
+                expression { !params.DEPLOY_FRONTEND_ONLY }
+            }
+            steps {
+                script {
+                    echo '======================================'
+                    echo '🗄️  SETTING UP DATABASE'
+                    echo '======================================'
+                    
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        // Check if database already exists
+                        def dbExists = sh(
+                            script: """
+                                ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                    sudo -u postgres psql -lqt | cut -d \\| -f 1 | grep -qw ${DB_NAME}
+                                    echo \$?
+                                '
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (dbExists == '0') {
+                            echo "✅ Database '${DB_NAME}' already exists"
+                        } else {
+                            echo "Creating database '${DB_NAME}'..."
+                            
+                            if (!params.DB_PASSWORD?.trim()) {
+                                error "❌ DB_PASSWORD is required for fresh database setup!"
+                            }
+                            
+                            sh """
+                                ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                    set -e
+                                    
+                                    # Create database user
+                                    sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '"'"'${params.DB_PASSWORD}'"'"';" || echo "User may already exist"
+                                    
+                                    # Create database
+                                    sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};" || echo "Database may already exist"
+                                    
+                                    # Grant privileges
+                                    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};"
+                                    
+                                    echo "✅ Database user and database created"
+                                '
+                            """
+                        }
+                        
+                        // Configure PostgreSQL authentication
+                        echo "Configuring PostgreSQL authentication..."
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                set -e
+                                
+                                # Backup pg_hba.conf
+                                sudo cp /etc/postgresql/*/main/pg_hba.conf /etc/postgresql/*/main/pg_hba.conf.bak || true
+                                
+                                # Add md5 authentication for bmi_user
+                                if ! sudo grep -q "local.*${DB_USER}.*md5" /etc/postgresql/*/main/pg_hba.conf; then
+                                    echo "local   all   ${DB_USER}   md5" | sudo tee -a /etc/postgresql/*/main/pg_hba.conf
+                                    echo "host    all   ${DB_USER}   127.0.0.1/32   md5" | sudo tee -a /etc/postgresql/*/main/pg_hba.conf
+                                    sudo systemctl reload postgresql
+                                    echo "✅ PostgreSQL authentication configured"
+                                else
+                                    echo "✅ PostgreSQL authentication already configured"
+                                fi
+                            '
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Create Backup') {
+            when {
+                expression { 
+                    env.DEPLOYMENT_TYPE == 'update' && !params.SKIP_BACKUP
+                }
+            }
+            steps {
+                script {
+                    echo '======================================'
+                    echo '💾 CREATING BACKUP OF EXISTING DEPLOYMENT'
+                    echo '======================================'
+                    echo "Backup directory: ${BACKUP_PATH}/${BACKUP_DIR}"
+                    
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                set -e
+                                
+                                # Create backup directory
+                                mkdir -p ${BACKUP_PATH}
+                                
+                                # Create backup
+                                echo "Creating backup..."
+                                cp -r ${DEPLOY_PATH} ${BACKUP_PATH}/${BACKUP_DIR}
+                                
+                                # Record backup metadata
+                                echo "Backup created: \$(date)" > ${BACKUP_PATH}/${BACKUP_DIR}/backup_info.txt
+                                echo "Build: ${env.BUILD_NUMBER}" >> ${BACKUP_PATH}/${BACKUP_DIR}/backup_info.txt
+                                cd ${DEPLOY_PATH} && git log -1 --pretty=format:\"Commit: %h - %s%nAuthor: %an%nDate: %ad\" >> ${BACKUP_PATH}/${BACKUP_DIR}/backup_info.txt || true
+                                
+                                echo "✅ Backup created successfully"
+                                echo "Backup size: \$(du -sh ${BACKUP_PATH}/${BACKUP_DIR} | cut -f1)"
+                                
+                                # Keep only last 5 backups
+                                echo "Cleaning up old backups (keeping last 5)..."
+                                cd ${BACKUP_PATH}
+                                ls -t | grep "^backup_" | tail -n +6 | xargs -r rm -rf
+                                echo "Current backups:"
+                                ls -lht | grep "^d" | head -5
+                            '
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to EC2') {
+            steps {
+                script {
+                    echo '======================================'
+                    echo '🚀 DEPLOYING TO EC2 SERVER'
+                    echo '======================================'
+                    
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        // Clone or update repository
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                set -e
+                                
+                                # Load NVM
+                                export NVM_DIR="\$HOME/.nvm"
+                                [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+                                # Clone or update repository on target EC2
+                                # Note: Target EC2 needs access to the Git repository
+                                # For private repos, configure Git credentials on EC2 or use deploy keys
+                                if [ -d "${DEPLOY_PATH}/.git" ]; then
+                                    echo "Updating existing repository..."
+                                    cd ${DEPLOY_PATH}
+                                    git fetch origin
+                                    git reset --hard origin/${BRANCH}
+                                    echo "✅ Repository updated"
+                                else
+                                    echo "Cloning repository..."
+                                    # Repository URL will be determined from git remote on Jenkins workspace
+                                    REPO_URL=\$(git config --get remote.origin.url)
+                                    git clone \$REPO_URL ${DEPLOY_PATH}
+                                    cd ${DEPLOY_PATH}
+                                    git checkout ${BRANCH}
+                                    echo "✅ Repository cloned"
+                                fi
+                                
+                                echo "Current commit: \$(git rev-parse --short HEAD)"
+                                echo "Commit message: \$(git log -1 --pretty=%B)"
+                            '
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Backend') {
+            when {
+                expression { !params.DEPLOY_FRONTEND_ONLY }
+            }
+            steps {
+                script {
+                    echo '======================================'
+                    echo '⚙️  DEPLOYING BACKEND'
+                    echo '======================================'
+                    
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                set -e
+                                
+                                # Load NVM
+                                export NVM_DIR="\$HOME/.nvm"
+                                [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+                                
+                                cd ${DEPLOY_PATH}/backend
+                                
+                                # Install dependencies
+                                echo "Installing backend dependencies..."
+                                npm install --production
+                                echo "✅ Dependencies installed"
+                                
+                                # Create .env file
+                                echo "Creating .env file..."
+                                cat > .env << EOF
+DATABASE_URL=postgresql://${DB_USER}:${params.DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASSWORD=${params.DB_PASSWORD}
+DB_NAME=${DB_NAME}
+DB_HOST=${DB_HOST}
+DB_PORT=${DB_PORT}
+PORT=${BACKEND_PORT}
+NODE_ENV=${NODE_ENV}
+CORS_ORIGIN=*
+EOF
+                                chmod 600 .env
+                                echo "✅ .env file created"
+                                
+                                # Run database migrations
+                                echo "Running database migrations..."
+                                for migration in migrations/*.sql; do
+                                    if [ -f "\$migration" ]; then
+                                        echo "Running migration: \$migration"
+                                        PGPASSWORD=${params.DB_PASSWORD} psql -U ${DB_USER} -d ${DB_NAME} -h ${DB_HOST} -f "\$migration" || echo "Migration may have already been applied"
+                                    fi
+                                done
+                                echo "✅ Migrations completed"
+                                
+                                # Start or restart PM2 process
+                                echo "Managing PM2 process..."
+                                if pm2 describe ${PM2_PROCESS_NAME} > /dev/null 2>&1; then
+                                    echo "Restarting existing PM2 process..."
+                                    pm2 restart ${PM2_PROCESS_NAME}
+                                else
+                                    echo "Starting new PM2 process..."
+                                    # Try ecosystem.config.js first, fallback to direct start
+                                    if [ -f "ecosystem.config.js" ]; then
+                                        pm2 start ecosystem.config.js
+                                    else
+                                        pm2 start src/server.js --name ${PM2_PROCESS_NAME}
+                                    fi
+                                fi
+                                
+                                pm2 save
+                                echo "✅ Backend deployed and PM2 process running"
+                                
+                                # Display PM2 status
+                                pm2 status
+                            '
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Frontend') {
+            when {
+                expression { !params.DEPLOY_BACKEND_ONLY }
+            }
+            steps {
+                script {
+                    echo '======================================'
+                    echo '🎨 DEPLOYING FRONTEND'
+                    echo '======================================'
+                    
+                    sshagent([env.EC2_SSH_KEY_ID]) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${params.TARGET_EC2_IP} '
+                                set -e
+                                
+                                # Load NVM
+                                export NVM_DIR="\$HOME/.nvm"
+                                [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+                                
+                                cd ${DEPLOY_PATH}/frontend
+                                
+                                # Install dependencies
+                                echo "Installing frontend dependencies..."
+                                npm install
+                                echo "✅ Dependencies installed"
+                                
+                                # Build frontend
+                                echo "Building frontend (this may take a few minutes)..."
+                                npm run build
+                                echo "✅ Frontend built successfully"
+                                
+                                # Deploy to Nginx
+                                echo "Deploying to Nginx..."
+                                sudo mkdir -p ${NGINX_SITE_PATH}
+                                sudo cp -r dist/* ${NGINX_SITE_PATH}/
+                                sudo chown -R www-data:www-data ${NGINX_SITE_PATH}
+                                sudo chmod -R 755 ${NGINX_SITE_PATH}
+                                echo "✅ Files copied to Nginx directory"
+                                
+                                # Configure Nginx (if not already configured)
+                                if [ ! -f "/etc/nginx/sites-available/${APP_NAME}" ]; then
+                                    echo "Creating Nginx configuration..."
+                                    sudo tee /etc/nginx/sites-available/${APP_NAME} > /dev/null << EOF
+server {
+    listen 80;
+    server_name _;
+    
+    root ${NGINX_SITE_PATH};
+    index index.html;
+    
+    # Frontend SPA routing
+    location / {
+        try_files \\\$uri \\\$uri/ /index.html;
+    }
+    
+    # Backend API proxy
+    location /api/ {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \\\$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \\\$host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\\$scheme;
+        proxy_cache_bypass \\\$http_upgrade;
+    }
+    
+    # Caching for static assets
+    location ~* \\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+EOF
+                                    
+                                    # Enable site
+                                    sudo ln -sf /etc/nginx/sites-available/${APP_NAME} /etc/nginx/sites-enabled/
+                                    sudo rm -f /etc/nginx/sites-enabled/default
+                                    
+                                    echo "✅ Nginx configured"
+                                else
+                                    echo "✅ Nginx already configured"
+                                fi
+                                
+                                # Test and reload Nginx
+                                echo "Testing Nginx configuration..."
+                                sudo nginx -t
+                                echo "Reloading Nginx..."
+                                sudo systemctl reload nginx
+                                echo "✅ Nginx reloaded"
+                                
+                                # Display Nginx status
+                                sudo systemctl status nginx --no-pager -l
+                            '
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Health Checks') {
+            when {
+                expression { !params.SKIP_HEALTH_CHECK }
+            }
+            steps {
+                script {
+                    echo '======================================'
+                    echo '❤️  PERFORMING HEALTH CHECKS'
+                    echo '======================================'
+                    
+                    // Backend health check
+                    if (!params.DEPLOY_FRONTEND_ONLY) {
+                        echo "Checking backend health..."
+                        retry(HEALTH_CHECK_RETRIES.toInteger()) {
+                            sleep(time: HEALTH_CHECK_DELAY.toInteger(), unit: 'SECONDS')
+                            
+                            def backendHealth = sh(
+                                script: "curl -sf http://${params.TARGET_EC2_IP}:${BACKEND_PORT}/health || exit 1",
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (backendHealth.contains('"status":"ok"')) {
+                                echo "✅ Backend health check passed"
+                                echo "Response: ${backendHealth}"
+                            } else {
+                                error "❌ Backend health check failed"
+                            }
+                        }
+                    }
+                    
+                    // Frontend health check
+                    if (!params.DEPLOY_BACKEND_ONLY) {
+                        echo "Checking frontend health..."
+                        retry(HEALTH_CHECK_RETRIES.toInteger()) {
+                            sleep(time: 5, unit: 'SECONDS')
+                            
+                            def frontendHealth = sh(
+                                script: "curl -sf -o /dev/null -w '%{http_code}' http://${params.TARGET_EC2_IP}/ || exit 1",
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (frontendHealth == '200') {
+                                echo "✅ Frontend health check passed (HTTP ${frontendHealth})"
+                            } else {
+                                error "❌ Frontend health check failed (HTTP ${frontendHealth})"
+                            }
+                        }
+                    }
+                    
+                    echo "\n✅ All health checks passed!"
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo '======================================'
+                echo 'PIPELINE COMPLETED'
+                echo '======================================'
+                def duration = currentBuild.durationString.replace(' and counting', '')
+                echo "Duration: ${duration}"
+                echo "Result: ${currentBuild.currentResult}"
+                echo "Build Number: ${env.BUILD_NUMBER}"
+                echo "Timestamp: ${BUILD_TIMESTAMP}"
+            }
+        }
+        
+        success {
+            script {
+                echo '======================================'
+                echo '✅ DEPLOYMENT SUCCESSFUL! 🎉'
+                echo '======================================'
+                echo "Application deployed to: http://${params.TARGET_EC2_IP}"
+                echo "Backend API: http://${params.TARGET_EC2_IP}:${BACKEND_PORT}/health"
+                echo "Frontend: http://${params.TARGET_EC2_IP}/"
+                echo "\nNext steps:"
+                echo "1. Test the application at http://${params.TARGET_EC2_IP}"
+                echo "2. Verify BMI calculations are working"
+                echo "3. Check trend charts display correctly"
+                echo "4. Monitor logs: ssh ${EC2_USER}@${params.TARGET_EC2_IP} 'pm2 logs ${PM2_PROCESS_NAME}'"
+                
+                // Optional: Send notification (uncomment and configure)
+                // emailext(
+                //     subject: "✅ Deployment Successful - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                //     body: "Deployment to ${params.TARGET_EC2_IP} completed successfully.\n\nApplication URL: http://${params.TARGET_EC2_IP}",
+                //     to: 'team@example.com'
+                // )
+            }
+        }
+        
+        failure {
+            script {
+                echo '======================================'
+                echo '❌ DEPLOYMENT FAILED! 😞'
+                echo '======================================'
+                echo "Build failed at stage: ${env.STAGE_NAME}"
+                echo "Check console output for details: ${env.BUILD_URL}console"
+                
+                if (env.DEPLOYMENT_TYPE == 'update' && !params.SKIP_BACKUP) {
+                    echo "\n⚠️  ROLLBACK RECOMMENDATION:"
+                    echo "A backup was created: ${BACKUP_PATH}/${BACKUP_DIR}"
+                    echo "To rollback, run: ssh ${EC2_USER}@${params.TARGET_EC2_IP} 'cd ${DEPLOY_PATH}/scripts && ./rollback.sh'"
+                }
+                
+                // Optional: Send notification (uncomment and configure)
+                // emailext(
+                //     subject: "❌ Deployment Failed - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                //     body: "Deployment to ${params.TARGET_EC2_IP} failed.\n\nCheck logs: ${env.BUILD_URL}console",
+                //     to: 'team@example.com'
+                // )
+            }
+        }
+        
+        cleanup {
+            script {
+                echo 'Cleaning up temporary files...'
+                // Clean workspace if needed
+                // cleanWs()
+            }
+        }
+    }
+}
