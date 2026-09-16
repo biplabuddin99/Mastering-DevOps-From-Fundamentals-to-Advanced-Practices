@@ -1,0 +1,104 @@
+# Example Terraform Variables Configuration
+# Copy this file to terraform.tfvars and update with your values
+# DO NOT commit terraform.tfvars to version control (add to .gitignore)
+
+# ===========================
+# AWS Configuration
+# ===========================
+
+# AWS Region
+aws_region = "us-east-1"
+
+# AWS CLI Named Profile
+# Make sure this profile is configured in ~/.aws/credentials
+aws_profile = "default"
+
+# Environment
+environment = "dev"
+
+# ===========================
+# EC2 Instance Configuration
+# ===========================
+
+# Instance Name
+instance_name = "bmi-health-tracker-server"
+
+# Instance Type
+# Recommended: t2.micro (free tier), t2.small, or t3.small
+instance_type = "t2.micro"
+
+# AMI ID - Ubuntu 22.04 LTS
+# Find latest AMI for your region:
+# aws ec2 describe-images --owners 099720109477 \
+#   --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+#   --query 'sort_by(Images, &CreationDate)[-1].[ImageId,Name]' \
+#   --output text --region <your-region>
+#
+# Common AMIs (Ubuntu 22.04 LTS):
+# us-east-1: ami-0e86e20dae9224db8
+# us-west-2: ami-03f65b8614a860c29
+# eu-west-1: ami-0905a3c97561e0b69
+ami_id = "ami-0e86e20dae9224db8"
+
+# EC2 Key Pair Name
+# Create a key pair in AWS Console or CLI first
+key_name = "my-ec2-keypair"
+
+# ===========================
+# Network Configuration
+# ===========================
+
+# VPC ID
+# Get from AWS Console or CLI:
+# aws ec2 describe-vpcs --query 'Vpcs[*].[VpcId,Tags[?Key==`Name`].Value|[0]]' --output table
+vpc_id = "vpc-xxxxxxxxxxxxxxxxx"
+
+# Subnet ID (Must be a PUBLIC subnet with internet gateway)
+# Get from AWS Console or CLI:
+# aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxx" --query 'Subnets[*].[SubnetId,AvailabilityZone,Tags[?Key==`Name`].Value|[0]]' --output table
+subnet_id = "subnet-xxxxxxxxxxxxxxxxx"
+
+# Security Group ID
+# Must allow the following inbound rules:
+#   - Port 22 (SSH) from your IP
+#   - Port 80 (HTTP) from 0.0.0.0/0
+#   - Port 443 (HTTPS) from 0.0.0.0/0 (optional, for future SSL)
+#   - All traffic within security group (for internal communication)
+#
+# Get from AWS Console or CLI:
+# aws ec2 describe-security-groups --filters "Name=vpc-id,Values=vpc-xxx" --query 'SecurityGroups[*].[GroupId,GroupName]' --output table
+security_group_id = "sg-xxxxxxxxxxxxxxxxx"
+
+# ===========================
+# Database Configuration
+# ===========================
+
+# PostgreSQL Database Name
+db_name = "bmidb"
+
+# PostgreSQL Database User
+db_user = "bmi_user"
+
+# PostgreSQL Database Password
+# IMPORTANT: Use a strong password
+# This will be stored in Terraform state - consider using AWS Secrets Manager in production
+db_password = "YourSecurePassword123!"
+
+# ===========================
+# Application Configuration
+# ===========================
+
+# Path to the deployment script
+# This should be relative to the terraform directory
+deployment_script_path = "../IMPLEMENTATION_AUTO.sh"
+
+# ===========================
+# Additional Tags
+# ===========================
+
+additional_tags = {
+  Owner       = "DevOps Team"
+  CostCenter  = "Engineering"
+  Compliance  = "None"
+  Backup      = "Daily"
+}

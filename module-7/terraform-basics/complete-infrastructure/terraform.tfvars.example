@@ -1,0 +1,26 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+aws_profile = "sarowar-ostad"
+aws_region  = "us-west-2"
+
+# VPC Configuration
+vpc_name = "my-terraform-vpc"
+vpc_cidr = "10.0.0.0/16"
+
+# Security Group Configuration
+security_group_name = "my-ec2-sg"
+allowed_ssh_cidr    = ["0.0.0.0/0"]  # Change to your IP for better security: ["YOUR-IP/32"]
+allowed_http_cidr   = ["0.0.0.0/0"]
+
+# EC2 Configuration
+instance_name = "my-ec2-instance"
+ami_id        = "ami-00f46ccd1cbfb363e"  # Amazon Linux 2023 in us-west-2
+instance_type = "t2.micro"
+key_name      = "ostad-batch-08"  # Your existing key pair name in AWS
+
+# Common Tags
+common_tags = {
+  Environment = "dev"
+  Project     = "terraform-complete-infrastructure"
+  ManagedBy   = "Terraform"
+}

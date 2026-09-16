@@ -1,0 +1,20 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+aws_profile = "sarowar-ostad"
+aws_region  = "us-west-2"
+
+instance_name = "my-ec2-instance"
+ami_id        = "ami-00f46ccd1cbfb363e"  # Replace with your AMI ID
+instance_type = "t3.medium"
+
+vpc_id            = "vpc-02f7c57975d04ca56"  # Replace with your VPC ID
+subnet_id         = "subnet-03672544009e3c40e"  # Replace with your Subnet ID
+security_group_id = "sg-07cc5ad28f68e8e55"  # Replace with your Security Group ID
+
+key_name = "ostad-batch-08"  # Optional: for SSH access
+
+tags = {
+  Environment = "dev"
+  Project     = "terraform-basics"
+  ManagedBy   = "Terraform"
+}

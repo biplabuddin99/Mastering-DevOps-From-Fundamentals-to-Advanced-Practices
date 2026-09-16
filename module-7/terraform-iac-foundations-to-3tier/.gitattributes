@@ -1,0 +1,45 @@
+# Normalize all text files to LF on commit and checkout.
+# This ensures consistent behavior across Windows, macOS, and Linux.
+* text=auto eol=lf
+
+# Terraform
+*.tf        text eol=lf
+*.tfvars    text eol=lf
+*.tfvars.example text eol=lf
+*.hcl       text eol=lf
+
+# Data / config
+*.json      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+*.env       text eol=lf
+*.env.example text eol=lf
+
+# Documentation
+*.md        text eol=lf
+*.txt       text eol=lf
+
+# Shell scripts (must have LF for POSIX shells on Linux)
+*.sh        text eol=lf
+
+# Web / Node
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+
+# Binary files — no conversion
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.tfstate   text eol=lf
+*.tfstate.backup text eol=lf

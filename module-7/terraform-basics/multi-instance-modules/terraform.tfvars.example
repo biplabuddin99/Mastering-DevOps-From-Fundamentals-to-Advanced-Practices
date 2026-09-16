@@ -1,0 +1,33 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+aws_profile = "sarowar-ostad"
+aws_region  = "us-west-2"
+environment = "dev"
+
+# Network Configuration
+vpc_id             = "vpc-02f7c57975d04ca56"
+public_subnet_id   = "subnet-03672544009e3c40e"     # Subnet with internet access
+private_subnet_id  = "subnet-xxxxxxxxxxxxxxxxx"     # Subnet without direct internet access
+
+# Security Groups (create separate SGs for each tier)
+web_security_group_id     = "sg-07cc5ad28f68e8e55"  # Allow HTTP/HTTPS from internet
+app_security_group_id     = "sg-xxxxxxxxxxxxxxxxx"  # Allow traffic from web tier
+db_security_group_id      = "sg-xxxxxxxxxxxxxxxxx"  # Allow traffic from app tier
+bastion_security_group_id = "sg-07cc5ad28f68e8e55"  # Allow SSH from your IP
+
+# Instance Configuration
+ami_id = "ami-00f46ccd1cbfb363e"  # Amazon Linux 2023 in us-west-2
+
+web_instance_type = "t2.micro"   # Web server
+app_instance_type = "t2.small"   # Application server
+db_instance_type  = "t2.medium"  # Database server
+
+key_name = "ostad-batch-08"
+
+# Common Tags
+common_tags = {
+  Environment = "dev"
+  Project     = "multi-instance-modules"
+  ManagedBy   = "Terraform"
+  Owner       = "DevOps Team"
+}
