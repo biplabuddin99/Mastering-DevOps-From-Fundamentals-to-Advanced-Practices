@@ -1,0 +1,296 @@
+# =============================================================================
+# Phase 3 — Monitoring and Observability Stack
+# =============================================================================
+# Deploys the full observability stack alongside the running application:
+#
+#   Metrics pipeline : node-exporter ──► prometheus ◄── cadvisor
+#   Log pipeline     : all containers ──► promtail ──► loki
+#   Visualisation    : grafana (datasources: prometheus + loki)
+#
+# PREREQUISITE: docker-compose.yml must be running first.
+# This file declares bmi-backend-network as an external network (created by
+# docker-compose.yml). Starting this file in isolation will fail with
+# "network bmi-backend-network not found" if the app stack is not up.
+#
+# All Grafana datasources and dashboards are provisioned automatically from
+# files in monitoring/grafana/provisioning/ and monitoring/grafana/dashboards/.
+# No manual Grafana configuration is required after deployment.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # node-exporter — Host System Metrics
+  # ---------------------------------------------------------------------------
+  # Exposes Linux kernel-level metrics (CPU, memory, disk I/O, network,
+  # filesystem, load average) from the host OS to Prometheus.
+  # Runs as a lightweight, read-only agent with no write access to the host.
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    command:
+      # Without these path flags, node-exporter reads /proc and /sys from its own
+      # container namespace and reports container-level metrics, not host-level ones.
+      # These flags redirect it to the host-bind-mounted paths instead.
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      # Exclude pseudo/virtual filesystems from disk metrics.
+      # Without this filter, node-exporter reports /sys, /proc, /dev, etc. as
+      # storage volumes, inflating filesystem panel counts in Grafana dashboards.
+      # $$ is the Compose-escaped form of a literal $ character in YAML.
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      # All mounts are read-only. node-exporter never writes to the host.
+      - /proc:/host/proc:ro   # Process and kernel statistics
+      - /sys:/host/sys:ro     # Kernel subsystem interfaces (cgroups, hwmon, etc.)
+      - /:/rootfs:ro          # Full host root — required for accurate disk usage metrics
+    networks:
+      - monitoring-network
+    restart: unless-stopped
+    expose:
+      # expose (not ports) makes port 9100 reachable within monitoring-network only.
+      # Prometheus scrapes this port over the internal network; no host exposure needed.
+      - 9100
+
+  # ---------------------------------------------------------------------------
+  # cadvisor — Container Resource Metrics
+  # ---------------------------------------------------------------------------
+  # cAdvisor (Container Advisor) introspects every running Docker container
+  # and exposes per-container CPU, memory, network I/O, and disk I/O metrics.
+  # Complements node-exporter (host-level) with container-level granularity.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    # privileged: true is required for cAdvisor to access the cgroup hierarchy
+    # and perf_event subsystems on the host. Without it, most per-container
+    # CPU and memory metrics are unavailable.
+    privileged: true
+    devices:
+      # /dev/kmsg access allows cAdvisor to read kernel ring buffer events.
+      # Without it, cAdvisor logs a repeated non-fatal warning on every scrape.
+      - /dev/kmsg
+    volumes:
+      # All mounts are read-only. cAdvisor never writes to the host filesystem.
+      - /:/rootfs:ro                          # Host root for filesystem metrics
+      - /var/run:/var/run:ro                  # Docker socket visibility
+      - /sys:/sys:ro                          # cgroup hierarchy for resource accounting
+      - /var/lib/docker/:/var/lib/docker:ro   # Docker container metadata and layer stats
+      - /dev/disk/:/dev/disk:ro               # Block device I/O metrics
+    networks:
+      - monitoring-network
+    restart: unless-stopped
+    expose:
+      - 8080  # Internal-only; Prometheus scrapes this within monitoring-network
+
+  # ---------------------------------------------------------------------------
+  # prometheus — Metrics Collection and Time-Series Storage
+  # ---------------------------------------------------------------------------
+  # Periodically scrapes (pulls) metrics from node-exporter, cadvisor, and
+  # the backend /metrics endpoint. Stores all data in its embedded TSDB.
+  # Grafana queries Prometheus using PromQL.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'       # Scrape targets and alerting rules
+      - '--storage.tsdb.path=/prometheus'                    # Write TSDB blocks to the named volume
+      - '--storage.tsdb.retention.time=15d'                  # Retain 15 days of metric history
+      # Hard size cap prevents the prometheus-data volume from filling the disk
+      # if retention.time is not reached first (e.g. on a high-cardinality workload).
+      - '--storage.tsdb.retention.size=10GB'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    volumes:
+      # Local prometheus/ directory contains prometheus.yml (scrape config) and
+      # any rules/*.yml files. Changes here require a Prometheus reload or restart.
+      - ./monitoring/prometheus:/etc/prometheus
+      # Named volume for TSDB data — survives container restarts and version upgrades.
+      - prometheus-data:/prometheus
+    networks:
+      - monitoring-network
+      # Prometheus is the ONLY monitoring service that joins bmi-backend-network.
+      # This allows it to resolve the `backend` hostname and scrape the Node.js
+      # /metrics endpoint. All other monitoring services stay on monitoring-network.
+      - bmi-backend-network
+    ports:
+      # Published to the host so the Grafana datasource can reach it and so the
+      # Prometheus expression browser is directly accessible for ad-hoc queries.
+      - "9090:9090"
+    restart: unless-stopped
+    healthcheck:
+      # /-/healthy returns HTTP 200 when Prometheus is ready to serve queries.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s   # Allow time for WAL replay and initial scrape cycle on restart
+
+  # ---------------------------------------------------------------------------
+  # loki — Log Aggregation Backend
+  # ---------------------------------------------------------------------------
+  # Receives log streams pushed by Promtail, stores them as compressed chunks,
+  # and serves LogQL queries from Grafana.
+  # Unlike Elasticsearch, Loki does NOT full-text index log content —
+  # only the label set is indexed. This keeps memory and storage usage very low.
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      # loki-config.yml controls retention period, storage backend (filesystem),
+      # chunk/index settings, and the HTTP listen port.
+      - ./monitoring/loki:/etc/loki
+      # Named volume for log chunk and index storage.
+      # Retaining this volume across upgrades preserves historical log data.
+      - loki-data:/loki
+    networks:
+      # Loki sits entirely within monitoring-network.
+      # It receives pushes from Promtail and serves queries to Grafana —
+      # both on the same network. No app-network attachment needed.
+      - monitoring-network
+    ports:
+      # Published to the host primarily to allow debug access via LogCLI.
+      # Grafana reaches Loki over monitoring-network at loki:3100 directly.
+      - "3100:3100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s   # Loki initialises its WAL, index, and chunk directories on first start
+
+  # ---------------------------------------------------------------------------
+  # promtail — Log Collector (Loki Agent)
+  # ---------------------------------------------------------------------------
+  # Discovers running Docker containers via the Docker socket, reads their log
+  # files, extracts labels from container metadata, and ships log streams to Loki.
+  # This is the collection half of the log pipeline (Promtail → Loki).
+  # No static list of container names is required — new services are discovered
+  # automatically as long as they use the json-file logging driver.
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./monitoring/promtail:/etc/promtail   # Agent config: scrape jobs and pipeline stages
+      # /var/lib/docker/containers holds the raw JSON log files written by Docker's
+      # json-file logging driver. Promtail tails these files for log collection.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # The Docker socket enables docker_sd_configs: dynamic container discovery,
+      # reading container labels, and building the Loki label set automatically.
+      # Read-only socket access is sufficient — Promtail never sends Docker API writes.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring-network
+    depends_on:
+      # Promtail retries failed pushes to Loki internally, but starting after Loki
+      # is ready avoids error bursts in Promtail logs and prevents WAL accumulation.
+      - loki
+    restart: unless-stopped
+    healthcheck:
+      # Promtail exposes a /ready endpoint on its HTTP server (default port 9080).
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9080/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # grafana — Unified Visualisation Layer
+  # ---------------------------------------------------------------------------
+  # Queries both Prometheus (metrics) and Loki (logs) and renders them in
+  # a single dashboard interface. All datasources and dashboards are provisioned
+  # from files — no manual setup is required after deployment.
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      # Override GRAFANA_PASSWORD in .env for any network-accessible deployment.
+      # The default 'admin' is only acceptable for local / private-network setups.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      # Prevent new users from self-registering. Only the admin account above exists.
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # %(protocol)s, %(domain)s, %(http_port)s are Grafana template variables that
+      # resolve to the actual protocol/host/port at runtime. This avoids hardcoding
+      # the EC2 IP (which changes across instance stops/starts) and ensures that
+      # dashboard share links and iframe embeds use the correct public URL.
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s:%(http_port)s/
+      # Empty string disables the GF_INSTALL_PLUGINS download on every container start.
+      # All panels used in the pre-provisioned dashboards are built into the official image.
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      # Named volume persists: user-created dashboards, alert rules, Grafana's
+      # internal SQLite database, and plugin installation state.
+      - grafana-data:/var/lib/grafana
+      # Provisioning directory: Grafana reads datasources.yml and dashboards.yml
+      # from this path at startup and automatically configures Prometheus and Loki.
+      # No manual "Add datasource" step is needed after initial deployment.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      # Dashboard JSON files in this directory are loaded by the provisioning config.
+      # Adding a new *.json file here makes it appear in Grafana on the next restart.
+      # All 5 pre-built dashboards (106 total panels) are provisioned this way.
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - monitoring-network
+    ports:
+      # Grafana's internal HTTP server listens on port 3000.
+      # Published as 3001 on the host to avoid confusion with the backend service
+      # (which also uses port 3000 internally, though it is not host-published).
+      - "3001:3000"
+    depends_on:
+      # Ensures Prometheus and Loki are started before Grafana begins its provisioning
+      # scan. Grafana will also retry datasource connections independently after startup,
+      # so this is a best-effort ordering guarantee rather than a strict health gate.
+      - prometheus
+      - loki
+    restart: unless-stopped
+    healthcheck:
+      # /api/health returns 200 when Grafana's HTTP server is ready to serve requests.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s   # Grafana provisioning scan runs during startup; allow it to complete
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  monitoring-network:
+    driver: bridge
+    name: bmi-monitoring-network
+  # bmi-backend-network is created and owned by docker-compose.yml.
+  # Declaring it here as `external: true` allows Prometheus to join it and
+  # scrape the backend metrics endpoint without modifying the app compose file.
+  # If the app stack is not running when this file starts, Docker will error:
+  #   "network bmi-backend-network declared as external, but could not be found"
+  bmi-backend-network:
+    external: true
+    name: bmi-backend-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+# All three volumes store independent data streams:
+#   prometheus-data : TSDB time-series blocks (metric history)
+#   loki-data       : log chunk files and index (log history)
+#   grafana-data    : SQLite database, user dashboards, alert state
+#
+# These volumes are deliberately separate from the application volumes in
+# docker-compose.yml, so stopping either stack does not affect the other's data.
+volumes:
+  prometheus-data:
+    driver: local
+    name: bmi-prometheus-data
+  loki-data:
+    driver: local
+    name: bmi-loki-data
+  grafana-data:
+    driver: local
+    name: bmi-grafana-data

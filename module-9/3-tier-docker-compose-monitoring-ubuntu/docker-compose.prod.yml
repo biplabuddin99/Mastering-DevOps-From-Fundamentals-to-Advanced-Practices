@@ -1,0 +1,111 @@
+# =============================================================================
+# Production Resource Limits Overlay
+# =============================================================================
+# This file is a Compose override that adds CPU and memory hard limits to each
+# application service. It is layered on top of docker-compose.yml at runtime —
+# it does NOT define new services or override image names. The locally-built
+# images from docker-compose.yml are used as-is. No Docker Hub account required.
+#
+# WHY THIS FILE EXISTS
+# Docker Compose does not enforce resource limits by default. A runaway process
+# (memory leak, CPU spike) can starve all other containers on the same host.
+# This overlay adds kernel-level cgroup enforcement via the deploy.resources block.
+#
+# LIMITS vs RESERVATIONS
+#   limits       : Hard ceiling. The kernel OOM-kills the process if exceeded.
+#   reservations : Soft guarantee. Docker's scheduler uses this as a minimum floor
+#                  when deciding where to place containers (relevant in Swarm mode;
+#                  informational in single-host Compose but documents intended sizing).
+#
+# restart: always (vs unless-stopped in docker-compose.yml)
+#   `unless-stopped` respects a manual `docker stop` — the container stays down
+#   until explicitly started again. `always` overrides this: the daemon restarts
+#   the container even after a deliberate stop.
+#   In production, `always` is the correct policy — you do not want a host reboot
+#   or a daemon restart to leave services offline without operator intervention.
+#
+# USAGE
+#   App + resource limits:
+#     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+#   App + resource limits + monitoring:
+#     docker compose \
+#       -f docker-compose.yml \
+#       -f docker-compose.prod.yml \
+#       -f docker-compose.monitoring.yml \
+#       up -d --build
+#
+# NOTE: Monitoring service limits are not included here because they are defined
+# in docker-compose.monitoring.yml and have different sizing requirements.
+# Add a docker-compose.monitoring.prod.yml overlay if you need to cap them.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # backend — Node.js/Express API
+  # ---------------------------------------------------------------------------
+  # 1 vCPU limit prevents a CPU-bound calculation from monopolising the host.
+  # 1 GB RAM limit triggers PM2's max_memory_restart at 500 MB (set in
+  # ecosystem.config.js) before the hard OOM kill kicks in at 1 GB — providing
+  # a graceful restart on memory leaks rather than an abrupt container kill.
+  backend:
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    restart: always   # Override unless-stopped from docker-compose.yml
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"   # Extra rotation file in prod (5 × 10 MB = 50 MB ceiling)
+
+  # ---------------------------------------------------------------------------
+  # frontend — Nginx static file server + API proxy
+  # ---------------------------------------------------------------------------
+  # Nginx is lightweight and I/O-bound. 0.5 vCPU is generous for a static
+  # file server on a single-instance deployment. Memory cap is conservative
+  # because Nginx buffers are configured per-request, not pre-allocated.
+  frontend:
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # postgres — PostgreSQL 14 data tier
+  # ---------------------------------------------------------------------------
+  # PostgreSQL's shared_buffers defaults to 128 MB on alpine images. 1 GB RAM
+  # limit provides comfortable headroom for the buffer pool, WAL writer, and
+  # active connection overhead on a t2.medium (4 GB total host memory).
+  # Postgres logs are more verbose than app logs; 50 MB max-size reflects that.
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"   # Postgres logs more verbosely than app services
+        max-file: "5"     # 5 × 50 MB = 250 MB on-disk ceiling

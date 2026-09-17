@@ -1,0 +1,246 @@
+# =============================================================================
+# Phase 2 — Application Stack
+# =============================================================================
+# Deploys the three-tier BMI Health Tracker application:
+#   postgres   (data tier)         : PostgreSQL 14 — the only stateful service
+#   backend    (logic tier)        : Node.js/Express API, managed by PM2
+#   frontend   (presentation tier) : React SPA compiled by Vite, served by Nginx
+#
+# Network isolation model:
+#   bmi-backend-network  : postgres ↔ backend only
+#   bmi-frontend-network : backend  ↔ frontend only
+#   The frontend cannot reach postgres — there is no shared network between them.
+#
+# Port exposure model:
+#   Only port 80 (frontend/Nginx) is published to the host.
+#   Backend (:3000) and Postgres (:5432) are reachable only within their networks.
+#
+# Named networks use explicit `name:` values so that docker-compose.monitoring.yml
+# can declare bmi-backend-network as an external network and attach Prometheus to it
+# without modifying this file.
+#
+# Usage:
+#   App only:           docker compose -f docker-compose.yml up -d --build
+#   App + monitoring:   docker compose -f docker-compose.yml \
+#                         -f docker-compose.monitoring.yml up -d --build
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # postgres — Data Tier
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 14 provides a stable, LTS-supported relational database.
+  # The -alpine variant reduces the image size (~70 MB vs ~350 MB for Debian)
+  # and shrinks the attack surface by removing unnecessary system packages.
+  postgres:
+    image: postgres:14-alpine
+    container_name: bmi-postgres  # Fixed name so CI/CD scripts and monitoring can reference it reliably
+    command:
+      # All flags below route Postgres log output to stderr so Docker's json-file
+      # driver captures it. logging_collector=off disables the secondary background
+      # log writer process — together these ensure Promtail receives all Postgres
+      # logs via the Docker socket with zero additional configuration.
+      - "postgres"
+      - "-c"
+      - "log_destination=stderr"
+      - "-c"
+      - "logging_collector=off"
+      # Log every new connection and disconnection.
+      # Useful for detecting connection leaks and unexpected client behaviour.
+      - "-c"
+      - "log_connections=on"
+      - "-c"
+      - "log_disconnections=on"
+      # Log DML/DDL statements (INSERT, UPDATE, DELETE, CREATE, DROP) but not SELECT.
+      # Captures write activity for audit purposes without flooding logs with read traffic.
+      - "-c"
+      - "log_statement=mod"
+      # Log any query whose execution time exceeds 500 ms.
+      # Surfaces slow queries before they become production incidents.
+      # Tune this threshold down (e.g. 100ms) for stricter performance monitoring.
+      - "-c"
+      - "log_min_duration_statement=500"
+      # Suppress DEBUG/INFO noise. WARNING and above are operationally actionable.
+      - "-c"
+      - "log_min_messages=warning"
+      # Prefix every log line with: timestamp [pid] user@database
+      # This structure enables Promtail pipeline stages to extract labels from Postgres logs.
+      - "-c"
+      - "log_line_prefix=%t [%p] %u@%d "
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bmi_user}
+      # :? syntax causes Compose to fail with a descriptive error if this variable is
+      # missing or empty. Never allow a blank password to reach any environment.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-bmidb}
+      # PGDATA points to a subdirectory inside the mounted volume path.
+      # Without this, Postgres refuses to initialise if Docker places a lost+found
+      # directory in the volume root (common on ext4 filesystems), which would leave
+      # the container in a crash loop on first start.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      # Named volume persists all database files across container restarts and upgrades.
+      # `docker compose down` does NOT remove this volume; only `down -v` does.
+      - postgres-data:/var/lib/postgresql/data
+      # PostgreSQL automatically runs every *.sql file in docker-entrypoint-initdb.d/
+      # exactly once, on the very first start when PGDATA is empty.
+      # Subsequent starts skip this directory entirely (idempotent by design).
+      # Mount as read-only so the container cannot alter the schema scripts.
+      - ./database/init-scripts:/docker-entrypoint-initdb.d:ro
+    networks:
+      # Joined to backend-network only. The frontend container has no network path
+      # to postgres and cannot open a TCP connection to port 5432.
+      # This enforces the three-tier access boundary at the network layer —
+      # no firewall rules or iptables configuration required.
+      - backend-network
+    # unless-stopped: auto-restarts on crash or host reboot, but respects
+    # `docker compose stop`. Allows deliberate maintenance without the daemon
+    # fighting the operator by restarting immediately after a manual stop.
+    restart: unless-stopped
+    healthcheck:
+      # pg_isready probes the TCP listener and the authentication path.
+      # It is a reliable liveness signal that the database is accepting queries —
+      # not merely that the process is running. The backend depends_on this check.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bmi_user} -d ${POSTGRES_DB:-bmidb}"]
+      interval: 10s       # Poll frequently; Postgres typically initialises in 5–15 s
+      timeout: 5s
+      retries: 5          # 5 consecutive failures before marking unhealthy
+      start_period: 30s   # Grace period for initial WAL setup and extension loading
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"   # Rotate the log file at 10 MB
+        max-file: "3"     # Keep 3 rotated files (30 MB total on-disk ceiling)
+        labels: "service=postgres"  # Attached to log metadata; used by Promtail for label extraction
+
+  # ---------------------------------------------------------------------------
+  # backend — Logic Tier
+  # ---------------------------------------------------------------------------
+  # The only service built locally from source (not pulled from a registry).
+  # `build:` triggers `docker build ./backend` using the multi-stage Dockerfile.
+  # The resulting image contains only Node.js runtime + app code — no build tooling.
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bmi-backend
+    environment:
+      PORT: 3000
+      NODE_ENV: ${NODE_ENV:-production}
+      # DATABASE_URL is constructed from individual .env variables so each component
+      # (user, password, host, port, db) can be overridden independently.
+      # The hostname `postgres` resolves via Docker's built-in DNS on bmi-backend-network
+      # because both services are members of that network.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bmi_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bmidb}
+      # FRONTEND_URL populates the Express CORS allow-list.
+      # Must match the public-facing URL that the browser uses to load the SPA.
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+    depends_on:
+      postgres:
+        # `service_healthy` (not the default `service_started`) blocks the backend
+        # container launch until Postgres passes its healthcheck above.
+        # Without this, the Node.js process crashes at startup with "connection refused"
+        # before Postgres is ready to accept connections — a race condition.
+        condition: service_healthy
+    networks:
+      # Joined to both networks: can reach postgres (via backend-network) and
+      # can be reached by the Nginx proxy (via frontend-network).
+      # The backend acts as the bridge between the data and presentation tiers.
+      - backend-network
+      - frontend-network
+    # Port 3000 is NOT published to the host. The backend is only reachable
+    # from the Nginx proxy on bmi-frontend-network. Direct external access
+    # is not required or desired — all traffic must flow through Nginx.
+    restart: unless-stopped
+    healthcheck:
+      # wget is available in node:18-alpine; curl is not installed by default.
+      # --spider performs a HEAD-like request — verifies the /health endpoint
+      # responds without downloading the response body.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s   # PM2 startup + pg connection pool initialisation takes ~20–30 s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=backend"
+
+  # ---------------------------------------------------------------------------
+  # frontend — Presentation Tier
+  # ---------------------------------------------------------------------------
+  # React SPA compiled at build time by Vite (Stage 1 in Dockerfile),
+  # then served as static assets by Nginx (Stage 2).
+  # Nginx also reverse-proxies /api/* and /health to the backend service,
+  # so the browser only ever communicates with port 80 — no CORS issues,
+  # no exposed backend port, no same-origin policy workarounds.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bmi-frontend
+    ports:
+      # The ONLY service that publishes a port to the host.
+      # All inbound traffic (browser, load balancer, CI/CD health checks) enters here.
+      # Backend and Postgres ports are intentionally absent from the ports section.
+      - "80:80"
+    depends_on:
+      backend:
+        # Wait for the backend to pass its healthcheck before starting Nginx.
+        # Without this, Nginx starts immediately and /api proxy requests return 502
+        # until the backend is ready — confusing during first boot or rolling deploys.
+        condition: service_healthy
+    networks:
+      # Joined to frontend-network only. The frontend has no network path to postgres.
+      # All database access must go through the backend API — enforced at the network layer.
+      - frontend-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s   # Nginx starts in under a second; short grace period is sufficient
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=frontend"
+
+# =============================================================================
+# Networks
+# =============================================================================
+# Two isolated bridge networks enforce strict three-tier access control:
+#
+#   bmi-backend-network  : postgres + backend
+#   bmi-frontend-network : backend + frontend
+#
+# postgres is NOT on bmi-frontend-network — it has no DNS entry visible to the
+# frontend container, and no TCP path to port 5432 exists.
+# A compromise of the frontend container cannot directly reach the database.
+#
+# Explicit `name:` values are required here so that docker-compose.monitoring.yml
+# can declare `bmi-backend-network: external: true` and attach Prometheus to it
+# to scrape the backend /metrics endpoint — without modifying this file.
+networks:
+  backend-network:
+    driver: bridge
+    name: bmi-backend-network    # Referenced as external by docker-compose.monitoring.yml
+  frontend-network:
+    driver: bridge
+    name: bmi-frontend-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+# Named volumes are managed by Docker and survive `docker compose down`.
+# They are ONLY removed with `docker compose down -v` (explicit destructive opt-in).
+# This prevents accidental data loss during routine redeployments and image upgrades.
+volumes:
+  postgres-data:
+    driver: local
+    name: bmi-postgres-data   # Explicit name makes `docker volume ls` output human-readable
